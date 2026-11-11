@@ -1,0 +1,24 @@
+# 저장 위치: .github/workflows/predict.yml
+# 20분마다 1시간 뒤 가용 병상 예측 → er_predictions 저장 (시각은 UTC 기준, 수집(*/10) 직후인 7·27·47분)
+name: predict
+
+on:
+  schedule:
+    - cron: "7,27,47 * * * *"
+  workflow_dispatch:   # Actions 화면에서 수동 실행 버튼
+
+jobs:
+  predict:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: python predict_now.py --write
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}

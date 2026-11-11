@@ -1,0 +1,8 @@
+{
+  "model": "lgbm_v1",
+  "horizon_min": 60,
+  "file": "models/lgbm_v1_h60.txt",
+  "mae": 1.155,
+  "trained": "2026-10-05 ~ 2026-11-01",
+  "validated": "2026-11-02 ~ 2026-11-08 (1주 시간 분할 검증)"
+}
