@@ -17,6 +17,7 @@
 import json
 import os
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 
 import lightgbm as lgb
@@ -29,6 +30,8 @@ FFILL_LIMIT = 3          # 학습과 동일: 값이 없는 칸은 직전 값으�
 LOOKBACK_MIN = 200       # 120분 전 차이 + 3시간 평균에 필요한 만큼
 STALE_LIMIT_MIN = 40     # 최신 수집이 이보다 오래되면 실패로 처리(수집 중단 알림)
 KEEP_DAYS = 2            # 목표 시각이 2일 지난 예측은 삭제
+ID_WINDOW = 15000        # 최신 id부터 이만큼 거슬러 읽음 (10분에 약 415행 → 약 6시간, 200분보다 넉넉히)
+RETRIES = 3              # 조회 실패 시 재시도 횟수
 VALS = ["hvec", "hvs01", "hvoc", "hvicc", "hvgc"]
 HOLIDAYS = pd.to_datetime(["2026-10-09", "2026-12-25"]).tz_localize(KST)
 DEMO_HPID = "A1100021"   # 시연 병원(삼육서울병원) — 시험 모드에서 따로 표시
@@ -63,31 +66,47 @@ def check(r, what):
         sys.exit(f"{what} 실패: HTTP {r.status_code}\n{r.text[:500]}")
 
 
+def get_json(url, key, params, what):
+    """일시적인 DB 시간 초과(HTTP 500, 57014)에 대비해 15초 간격으로 최대 3번 시도"""
+    for attempt in range(1, RETRIES + 1):
+        r = requests.get(f"{url}/rest/v1/er_snapshots", params=params, headers=headers(key), timeout=30)
+        if r.ok:
+            return r.json()
+        print(f"  {what} 실패 {attempt}/{RETRIES}: HTTP {r.status_code} {r.text[:120]}")
+        if attempt < RETRIES:
+            time.sleep(15)
+    check(r, what)
+
+
 def fetch_snapshots(url, key):
-    since = (datetime.now(timezone.utc) - timedelta(minutes=LOOKBACK_MIN)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    rows, offset = [], 0
+    """기본키(id) 범위로만 읽음 (DB 변경 없음).
+    - recorded_at 조건: recorded_at 단독 인덱스가 없어 표 전체를 훑다 시간 초과(11/11)
+    - id 내림차순 + offset: 대부분 되지만 가끔 시간 초과(11/12 01시 실패 메일)
+    → 최신 id 1개를 먼저 찾고, 그보다 ID_WINDOW 작은 id부터 'id > 커서' 조건으로 1000행씩 읽음(항상 기본키 범위 조회).
+      기간(LOOKBACK_MIN)은 Python에서 거름"""
+    since = pd.Timestamp.now(tz="UTC") - pd.Timedelta(minutes=LOOKBACK_MIN)
+    top = get_json(url, key, {"select": "id", "order": "id.desc", "limit": 1}, "최신 id 조회")
+    if not top:
+        sys.exit("er_snapshots가 비어 있습니다")
+    cursor = top[0]["id"] - ID_WINDOW
+    rows = []
     while True:
-        r = requests.get(
-            f"{url}/rest/v1/er_snapshots",
-            params={
-                "select": "hpid,recorded_at," + ",".join(VALS),
-                "recorded_at": f"gte.{since}",
-                "order": "id.asc",
-                "limit": 1000,
-                "offset": offset,
-            },
-            headers=headers(key),
-            timeout=30,
-        )
-        check(r, "er_snapshots 조회")
-        batch = r.json()
+        batch = get_json(url, key, {
+            "select": "id,hpid,recorded_at," + ",".join(VALS),
+            "id": f"gt.{cursor}",
+            "order": "id.asc",
+            "limit": 1000,
+        }, "er_snapshots 조회")
         rows += batch
         if len(batch) < 1000:
             break
-        offset += 1000
-    if not rows:
+        cursor = batch[-1]["id"]
+    df = pd.DataFrame(rows)
+    df = df[pd.to_datetime(df["recorded_at"], utc=True, format="mixed") >= since]
+    if df.empty:
         sys.exit("최근 데이터가 없습니다 (수집 중단 또는 키 권한 확인)")
-    return pd.DataFrame(rows)
+    print(f"er_snapshots {len(rows):,}행 받음 → 최근 {LOOKBACK_MIN}분 {len(df):,}행 사용")
+    return df.drop(columns="id")
 
 
 def build_features(df):
@@ -125,6 +144,10 @@ def build_features(df):
 def predict(now, base, info):
     model = lgb.Booster(model_file=info["file"])
     feats = model.feature_name()
+    missing = [f for f in feats if f not in now.columns]
+    if missing:
+        sys.exit(f"모델이 요구하는 특성 {missing}을 계산하지 않습니다 → 모델 파일 버전 확인 "
+                 f"(train_lgbm.py 기본값으로 다시 학습한 파일인지)")
     X = now[feats].copy()
     for c in feats:
         X[c] = X[c].astype("category") if c == "hpid" else X[c].astype("float32")
